@@ -1,0 +1,17 @@
+/target
+/.pre-commit-config.yaml
+/.sass-cache/
+/dist/
+/.direnv
+/flamegraph.svg
+/perf.data
+/perf.data.old
+/tarpaulin-report.html
+snort*.png
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
+/result
