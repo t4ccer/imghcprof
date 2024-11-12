@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use imgui::{
     Id, ProgressBar, SelectableFlags, TableColumnFlags, TableColumnSetup, TableFlags,
     TableSortDirection, TreeNodeFlags,
@@ -5,10 +7,13 @@ use imgui::{
 use std::{
     borrow::Cow,
     cmp::Ordering,
+    env,
+    ffi::OsStr,
     fmt::Display,
-    fs::File,
+    fs::{self, read_dir, File},
     io::Read,
     num::{ParseFloatError, ParseIntError},
+    path::{Path, PathBuf},
     str::Lines,
     sync::{Arc, Mutex},
 };
@@ -26,7 +31,7 @@ fn main() {
         }};
     }
 
-    let mut args = std::env::args().into_iter();
+    let mut args = env::args().into_iter();
     let _prog = args.next().unwrap_or_else(|| err_exit!());
     let input_file = args.next().unwrap_or_else(|| err_exit!());
     if !args.next().is_none() {
@@ -41,29 +46,31 @@ fn main() {
         err_exit!("imghcprof: Could not read input file '{input_file}': {err}")
     });
 
-    let mut parser = Parser::new(&input).unwrap_or_else(|err| {
-        err_exit!("imghcprof: Could not parse input file '{input_file}': {err}")
-    });
-    let mut tree = parser.parse_tree().unwrap_or_else(|err| {
-        err_exit!("imghcprof: Could not parse input file '{input_file}': {err}")
-    });
-    tree.open_interesting();
+    // let mut parser = Parser::new(&input).unwrap_or_else(|err| {
+    //     err_exit!("imghcprof: Could not parse input file '{input_file}': {err}")
+    // });
+    // let mut tree = parser.parse_tree().unwrap_or_else(|err| {
+    //     err_exit!("imghcprof: Could not parse input file '{input_file}': {err}")
+    // });
+    // tree.open_interesting();
 
     let mut first_run = true;
-    let mut windows = Vec::new();
-    windows.push((
-        None,
-        Window {
-            title: "Profile".to_string(),
-            tree,
-        },
-    ));
+    let mut windows: Vec<(Option<bool>, Window)> = Vec::new();
+    // windows.push((
+    //     None,
+    //     Window {
+    //         title: "Profile".to_string(),
+    //         tree,
+    //     },
+    // ));
 
     // Windows request new windows via this mutex
     let new_window: Arc<Mutex<Option<NewWindow>>> = Arc::new(Mutex::new(None));
 
     // There can be duplicate window titles so we add invisible counter
     let mut next_window_no = 0;
+    let mut file_picker = FilePicker::new(env::current_dir().unwrap_or("/".into()));
+    let mut selecting_file = true;
 
     boilerplate_sdl2::draw("imghcprof", |ui| {
         // Create main tab with profiler window
@@ -80,10 +87,27 @@ fn main() {
             dockspace
         };
 
-        // TODO: File selector
-        // if let Some(_main_menu) = ui.begin_main_menu_bar() {
-        //     if let Some(_new_menu) = ui.begin_menu("Open") {}
-        // }
+        if let Some(_main_menu) = ui.begin_main_menu_bar() {
+            if let Some(_new_menu) = ui.begin_menu("Open") {
+                if ui.menu_item(".perf file") {
+                    selecting_file = true;
+                }
+            }
+        }
+
+        if selecting_file {
+            ui.open_popup("Select File");
+            if let Some(_t) = ui.begin_modal_popup("Select File") {
+                if let Some(picked) = file_picker.draw(ui) {
+                    dbg!(picked);
+                    selecting_file = false;
+                }
+            }
+        }
+
+        ui.show_demo_window(&mut true);
+
+        return;
 
         for (is_opened, window) in &mut windows {
             let mut w = ui
@@ -116,7 +140,7 @@ fn main() {
                     name,
                 } => {
                     let new_tree = CostTree::find(&windows[0].1.tree, &module, &source, &name);
-                    let title = format!("Calls to `{name}` ## {next_window_no}");
+                    let title = format!("Calls to `{name}`## {next_window_no}");
                     windows.push((
                         Some(true),
                         Window {
@@ -128,7 +152,7 @@ fn main() {
                 }
                 NewWindow::Focus { name, cost_center } => {
                     if let Some(new_tree) = CostTree::focus(&windows[0].1.tree, cost_center) {
-                        let title = format!("Focus on `{name}` ## {next_window_no}");
+                        let title = format!("Focus on `{name}`## {next_window_no}");
                         windows.push((
                             Some(true),
                             Window {
@@ -142,6 +166,91 @@ fn main() {
             }
         }
     });
+}
+
+struct FilePicker {
+    picked: Option<PathBuf>,
+    initial_path: PathBuf,
+    show_all: bool,
+}
+
+impl FilePicker {
+    fn new(initial_path: PathBuf) -> Self {
+        Self {
+            picked: None,
+            initial_path,
+            show_all: false,
+        }
+    }
+
+    fn draw(&mut self, ui: &imgui::Ui) -> Option<PathBuf> {
+        let mut selected = false;
+        ui.disabled(self.picked.is_none(), || selected = ui.button("Select"));
+        ui.same_line();
+        ui.checkbox("Show all", &mut self.show_all);
+
+        let mut ancestors = self
+            .initial_path
+            .ancestors()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        draw_top_directory(ui, ancestors.as_slice(), &mut self.picked);
+        selected.then_some(self.picked.clone()?)
+    }
+}
+
+fn draw_top_directory(ui: &imgui::Ui, paths: &[PathBuf], picked: &mut Option<PathBuf>) {
+    if paths.len() == 0 {
+        // unreachable?
+        return;
+    } else if paths.len() == 1 {
+        draw_directory(ui, &paths[0], picked);
+    } else {
+        if let Some(_t) = ui
+            .tree_node_config(
+                paths[0]
+                    .file_name()
+                    .unwrap_or(OsStr::new("/"))
+                    .to_str()
+                    .unwrap_or("???"),
+            )
+            .opened(true, imgui::Condition::Appearing)
+            .push()
+        {
+            draw_top_directory(ui, &paths[1..], picked);
+        }
+    }
+}
+
+fn draw_directory(ui: &imgui::Ui, d: &PathBuf, picked: &mut Option<PathBuf>) {
+    // TODO: PERF! Cache results, etc. don't syscall and alloc on every frame
+    // but this is open rarely and for rather short so not a priority
+
+    for f in read_dir(&d).unwrap() {
+        let f = f.unwrap();
+
+        if f.file_type().unwrap().is_dir() {
+            if let Some(_t) = ui.tree_node(f.path().file_name().unwrap().to_str().unwrap_or("<?>"))
+            {
+                draw_directory(ui, &f.path(), picked);
+            }
+        } else {
+            let selected = picked.as_ref().is_some_and(|picked| picked == &f.path());
+
+            if let Some(_t) = ui
+                .tree_node_config(f.path().file_name().unwrap().to_str().unwrap_or("<?>"))
+                .bullet(true)
+                .leaf(true)
+                .selected(selected)
+                .push()
+            {
+                if ui.is_item_clicked() {
+                    *picked = Some(f.path().clone());
+                }
+            }
+        }
+    }
 }
 
 fn draw_cost_tree(ui: &imgui::Ui, tree: &mut CostTree, new_window: Arc<Mutex<Option<NewWindow>>>) {
