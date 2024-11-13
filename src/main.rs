@@ -6,6 +6,7 @@ use imgui::{
 use std::{
     borrow::Cow,
     cmp::Ordering,
+    collections::BTreeMap,
     env,
     ffi::{CString, OsStr},
     fmt::Display,
@@ -24,7 +25,7 @@ use std::{
 mod boilerplate_sdl2;
 
 fn main() {
-    let mut windows: Vec<(bool, Window)> = Vec::new();
+    let mut windows: BTreeMap<u32, (bool, Window)> = BTreeMap::new();
 
     // There can be duplicate window titles so we add invisible counter
     let mut next_window_no = 0;
@@ -100,7 +101,7 @@ fn main() {
             }
         }
 
-        for (is_opened, window) in &mut windows {
+        for (_, (is_opened, window)) in &mut windows {
             ui.window(&window.title)
                 .menu_bar(false)
                 .collapsible(false)
@@ -112,7 +113,7 @@ fn main() {
                 });
         }
 
-        windows.retain(|(is_opened, _)| *is_opened);
+        windows.retain(|_, (is_opened, _)| *is_opened);
 
         if let Some(new) = new_window.lock().unwrap().take() {
             add_new_window(new, &mut windows, &mut next_window_no, dockspace);
@@ -122,7 +123,7 @@ fn main() {
 
 fn add_new_window(
     new: NewWindow,
-    windows: &mut Vec<(bool, Window)>,
+    windows: &mut BTreeMap<u32, (bool, Window)>,
     next_window_no: &mut u32,
     dockspace: imgui_sys::ImGuiID,
 ) {
@@ -133,27 +134,29 @@ fn add_new_window(
             name,
             root_id,
         } => {
-            let raw = Rc::clone(&windows[root_id as usize].1.raw);
-            let new_tree =
-                CostTree::find(&windows[root_id as usize].1.tree, &module, &source, &name);
+            let raw = Rc::clone(&windows[&root_id].1.raw);
+            let new_tree = CostTree::find(&windows[&root_id].1.tree, &module, &source, &name);
             let title = format!(
                 "Calls to `{}` (`{}`)## {}",
-                name, windows[root_id as usize].1.fname, next_window_no
+                name, windows[&root_id].1.fname, next_window_no
             );
             let ctitle = CString::new(title.as_bytes()).unwrap();
             unsafe {
                 imgui_sys::igDockBuilderDockWindow(ctitle.as_ptr().cast(), dockspace);
             }
-            windows.push((
-                true,
-                Window {
-                    title,
-                    tree: new_tree,
-                    root_id,
-                    fname: windows[root_id as usize].1.fname.clone(),
-                    raw,
-                },
-            ));
+            windows.insert(
+                *next_window_no,
+                (
+                    true,
+                    Window {
+                        title,
+                        tree: new_tree,
+                        root_id,
+                        fname: windows[&root_id].1.fname.clone(),
+                        raw,
+                    },
+                ),
+            );
             *next_window_no += 1;
         }
         NewWindow::Focus {
@@ -161,27 +164,29 @@ fn add_new_window(
             cost_center,
             root_id,
         } => {
-            let raw = Rc::clone(&windows[root_id as usize].1.raw);
-            if let Some(new_tree) = CostTree::focus(&windows[root_id as usize].1.tree, cost_center)
-            {
+            let raw = Rc::clone(&windows[&root_id].1.raw);
+            if let Some(new_tree) = CostTree::focus(&windows[&root_id].1.tree, cost_center) {
                 let title = format!(
                     "Focus on `{}` (`{}`)## {}",
-                    name, windows[root_id as usize].1.fname, next_window_no
+                    name, windows[&root_id].1.fname, next_window_no
                 );
                 let ctitle = CString::new(title.as_bytes()).unwrap();
                 unsafe {
                     imgui_sys::igDockBuilderDockWindow(ctitle.as_ptr().cast(), dockspace);
                 }
-                windows.push((
-                    true,
-                    Window {
-                        title,
-                        tree: new_tree,
-                        root_id,
-                        fname: windows[root_id as usize].1.fname.clone(),
-                        raw,
-                    },
-                ));
+                windows.insert(
+                    *next_window_no,
+                    (
+                        true,
+                        Window {
+                            title,
+                            tree: new_tree,
+                            root_id,
+                            fname: windows[&root_id].1.fname.clone(),
+                            raw,
+                        },
+                    ),
+                );
                 *next_window_no += 1;
             }
         }
@@ -202,6 +207,8 @@ fn add_new_window(
                     .ok()?;
 
                 let input = StringStorage::new(input);
+                // Ugly hack to work around self referential fields
+                // but doubles the parsing speed so here we are
                 let input_slice = unsafe {
                     str::from_utf8_unchecked(std::slice::from_raw_parts(
                         input.as_str().as_ptr(),
@@ -241,16 +248,19 @@ fn add_new_window(
                 unsafe {
                     imgui_sys::igDockBuilderDockWindow(ctitle.as_ptr().cast(), dockspace);
                 }
-                windows.push((
-                    true,
-                    Window {
-                        title,
-                        tree,
-                        root_id: *next_window_no,
-                        fname: fname.to_owned(),
-                        raw: Rc::new(input),
-                    },
-                ));
+                windows.insert(
+                    *next_window_no,
+                    (
+                        true,
+                        Window {
+                            title,
+                            tree,
+                            root_id: *next_window_no,
+                            fname: fname.to_owned(),
+                            raw: Rc::new(input),
+                        },
+                    ),
+                );
                 *next_window_no += 1;
             }
         }
