@@ -54,6 +54,7 @@
               pkgs.rustc
               pkgs.rust-analyzer
               pkgs.rustfmt
+              pkgs.hyperfine
             ];
 
             buildInputs = [

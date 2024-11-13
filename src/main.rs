@@ -1,16 +1,22 @@
+use core::str;
 use imgui::{
     Id, ProgressBar, SelectableFlags, TableColumnFlags, TableColumnSetup, TableFlags,
     TableSortDirection, TreeNodeFlags,
 };
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     env,
     ffi::{CString, OsStr},
     fmt::Display,
     fs::{read_dir, File},
     io::Read,
-    num::{ParseFloatError, ParseIntError},
+    iter::Peekable,
+    marker::PhantomData,
+    num::{NonZero, ParseFloatError, ParseIntError},
     path::{Path, PathBuf},
+    pin::Pin,
+    rc::Rc,
     str::Lines,
     sync::{Arc, Mutex},
 };
@@ -127,6 +133,7 @@ fn add_new_window(
             name,
             root_id,
         } => {
+            let raw = Rc::clone(&windows[root_id as usize].1.raw);
             let new_tree =
                 CostTree::find(&windows[root_id as usize].1.tree, &module, &source, &name);
             let title = format!(
@@ -144,6 +151,7 @@ fn add_new_window(
                     tree: new_tree,
                     root_id,
                     fname: windows[root_id as usize].1.fname.clone(),
+                    raw,
                 },
             ));
             *next_window_no += 1;
@@ -153,6 +161,7 @@ fn add_new_window(
             cost_center,
             root_id,
         } => {
+            let raw = Rc::clone(&windows[root_id as usize].1.raw);
             if let Some(new_tree) = CostTree::focus(&windows[root_id as usize].1.tree, cost_center)
             {
                 let title = format!(
@@ -170,13 +179,14 @@ fn add_new_window(
                         tree: new_tree,
                         root_id,
                         fname: windows[root_id as usize].1.fname.clone(),
+                        raw,
                     },
                 ));
                 *next_window_no += 1;
             }
         }
         NewWindow::Profile { input_file } => {
-            let mk_tree = || -> Option<CostTree> {
+            let mk_tree = || {
                 let mut input = String::new();
                 let mut f = File::open(&input_file)
                     .map_err(|err| {
@@ -191,24 +201,35 @@ fn add_new_window(
                     })
                     .ok()?;
 
-                let mut parser = Parser::new(&input)
+                let input = StringStorage::new(input);
+                let input_slice = unsafe {
+                    str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        input.as_str().as_ptr(),
+                        input.as_str().len(),
+                    ))
+                };
+
+                let parser = Parser::new(&input_slice)
                     .map_err(|err| {
                         eprintln!("imghcprof: Could not parse input file '{input_file:?}': {err}");
                         ()
                     })
                     .ok()?;
-                let mut tree = parser
-                    .parse_tree()
+
+                let flat = parser
+                    .parse_entries()
                     .map_err(|err| {
                         eprintln!("imghcprof: Could not parse input file '{input_file:?}': {err}");
                         ()
                     })
                     .ok()?;
+
+                let mut tree = parse_tree(&mut flat.into_iter().peekable());
                 tree.open_interesting();
-                Some(tree)
+                Some((input, tree))
             };
 
-            if let Some(tree) = mk_tree() {
+            if let Some((input, tree)) = mk_tree() {
                 let fname = input_file
                     .file_name()
                     .unwrap_or(OsStr::new("?"))
@@ -227,6 +248,7 @@ fn add_new_window(
                         tree,
                         root_id: *next_window_no,
                         fname: fname.to_owned(),
+                        raw: Rc::new(input),
                     },
                 ));
                 *next_window_no += 1;
@@ -568,50 +590,58 @@ fn draw_cost_subtree(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Displayed<T> {
+struct Displayed<'raw, T> {
     value: T,
-    string: String,
+    string: Cow<'raw, str>,
 }
 
-impl<T> Displayed<T>
+impl<'raw, T> Displayed<'raw, T>
 where
     T: Display,
 {
-    pub fn new(value: T) -> Displayed<T> {
+    pub fn new(value: T) -> Displayed<'static, T> {
         Displayed {
-            string: value.to_string(),
+            string: Cow::Owned(value.to_string()),
+            value,
+        }
+    }
+
+    pub fn borrowed(value: T, string: &'raw str) -> Displayed<'raw, T> {
+        Displayed {
+            string: Cow::Borrowed(string),
             value,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
-struct Entry {
-    cost_center: Displayed<u64>,
-    name: String,
-    entries: Displayed<u64>,
-    individual_time: Displayed<f32>,
-    individual_alloc: Displayed<f32>,
-    inherited_time: Displayed<f32>,
-    inherited_alloc: Displayed<f32>,
-    module: String,
-    source: String,
+struct Entry<'raw> {
+    cost_center: Displayed<'raw, u64>,
+    name: Cow<'raw, str>,
+    entries: Displayed<'raw, u64>,
+    individual_time: Displayed<'raw, f32>,
+    individual_alloc: Displayed<'raw, f32>,
+    inherited_time: Displayed<'raw, f32>,
+    inherited_alloc: Displayed<'raw, f32>,
+    module: Cow<'raw, str>,
+    source: Cow<'raw, str>,
     opened: bool,
+    indent: u32,
 }
 
-impl Entry {
+impl<'raw> Entry<'raw> {
     fn is_interesting(&self) -> bool {
         self.inherited_time.value >= 15.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
-struct CostTree {
-    entries: Vec<(Entry, CostTree)>,
+struct CostTree<'raw> {
+    entries: Vec<(Entry<'raw>, CostTree<'raw>)>,
 }
 
-impl CostTree {
-    fn sort_by_f32(&mut self, dir: TableSortDirection, f: impl Copy + Fn(&Entry) -> f32) {
+impl<'raw> CostTree<'raw> {
+    fn sort_by_f32(&mut self, dir: TableSortDirection, f: impl Copy + Fn(&Entry<'raw>) -> f32) {
         match dir {
             TableSortDirection::Ascending => {
                 self.entries.sort_unstable_by(|(entry1, _), (entry2, _)| {
@@ -669,7 +699,7 @@ impl CostTree {
         }
     }
 
-    fn find<'a>(&'a self, target_module: &str, target_source: &str, target_name: &str) -> CostTree {
+    fn find(&self, target_module: &str, target_source: &str, target_name: &str) -> CostTree<'raw> {
         let mut entries = Vec::new();
 
         for (entry, child_tree) in &self.entries {
@@ -704,7 +734,7 @@ impl CostTree {
         CostTree { entries }
     }
 
-    fn focus(&self, cost_center: u64) -> Option<CostTree> {
+    fn focus(&self, cost_center: u64) -> Option<CostTree<'raw>> {
         for (entry, children) in &self.entries {
             if entry.cost_center.value == cost_center {
                 return Some(CostTree {
@@ -742,13 +772,13 @@ impl Display for ParserError {
 
 const NO_LOCATION_INFO: &'static str = "<no location info>";
 
-struct Parser<'src> {
-    lines: Lines<'src>,
-    line: Option<&'src str>,
+struct Parser<'raw> {
+    lines: Lines<'raw>,
+    line: Option<&'raw str>,
 }
 
-impl<'src> Parser<'src> {
-    pub fn new(input: &'src str) -> Result<Self, ParserError> {
+impl<'raw> Parser<'raw> {
+    pub fn new(input: &'raw str) -> Result<Self, ParserError> {
         let mut s = Self {
             lines: input.lines(),
             line: None,
@@ -771,20 +801,54 @@ impl<'src> Parser<'src> {
             .starts_with("COST CENTRE")
         {}
         self.lines.next().ok_or_else(|| ParserError::EndOfInput)?;
+
         self.line = self.lines.next();
         Ok(())
     }
 
-    pub fn next_indent(&self) -> Option<u32> {
-        self.line
-            .map(|line| line.chars().take_while(|&c| c == ' ').count() as u32 + 1)
+    fn parse_entries(&self) -> Result<Vec<Entry<'raw>>, ParserError> {
+        let no_lines = self.lines.clone().count();
+        let no_threads = std::thread::available_parallelism()
+            .map(NonZero::get)
+            .unwrap_or(8);
+        let lines_per_thread = no_lines / no_threads;
+
+        std::thread::scope(|scope| {
+            let mut threads = Vec::with_capacity(no_threads);
+            let mut combined = Vec::with_capacity(no_lines);
+
+            for i in 0..no_threads {
+                let lines = self.lines.clone();
+                let t = scope.spawn(move || {
+                    let mut result = Vec::with_capacity(lines_per_thread);
+                    for line in
+                        lines
+                            .clone()
+                            .skip(lines_per_thread * i)
+                            .take(if i + 1 == no_threads {
+                                usize::MAX
+                            } else {
+                                lines_per_thread
+                            })
+                    {
+                        result.push(Self::parse_line(line)?);
+                    }
+                    Ok::<_, ParserError>(result)
+                });
+                threads.push(t);
+            }
+
+            for t in threads {
+                let r = t.join().unwrap()?;
+                combined.extend(r);
+            }
+
+            Ok(combined)
+        })
     }
 
-    pub fn parse_entry(&mut self) -> Result<Option<Entry>, ParserError> {
-        let Some(line) = self.line else {
-            return Ok(None);
-        };
-
+    fn parse_line(line: &'raw str) -> Result<Entry<'raw>, ParserError> {
+        let indent = line.chars().take_while(|&c| c == ' ').count() as u32 + 1;
         let mut values = line.split_ascii_whitespace();
 
         macro_rules! parse_value {
@@ -796,9 +860,9 @@ impl<'src> Parser<'src> {
                     // We assume that this is the only case and hard code it here
                     values.next().ok_or_else(|| ParserError::EndOfInput)?;
                     values.next().ok_or_else(|| ParserError::EndOfInput)?;
-                    NO_LOCATION_INFO.to_owned()
+                    Cow::Borrowed(NO_LOCATION_INFO)
                 } else {
-                    start.to_owned()
+                    Cow::Borrowed(start)
                 }
             }};
             (u64) => {{
@@ -806,14 +870,14 @@ impl<'src> Parser<'src> {
                 let parsed = string
                     .parse::<u64>()
                     .map_err(|err| ParserError::ParseIntError(err, line.to_string()))?;
-                Displayed::new(parsed)
+                Displayed::borrowed(parsed, string)
             }};
             (f32) => {{
                 let string = values.next().ok_or_else(|| ParserError::EndOfInput)?;
                 let parsed = string
                     .parse::<f32>()
                     .map_err(|err| ParserError::ParseFloatError(err, line.to_string()))?;
-                Displayed::new(parsed)
+                Displayed::borrowed(parsed, string)
             }};
         }
 
@@ -828,38 +892,41 @@ impl<'src> Parser<'src> {
             inherited_time: parse_value!(f32),
             inherited_alloc: parse_value!(f32),
             opened: false,
+            indent,
         };
 
-        self.line = self.lines.next();
-
-        Ok(Some(entry))
+        Ok(entry)
     }
+}
 
-    fn parse_subtree(&mut self, parent_indent: u32) -> Result<CostTree, ParserError> {
-        let mut entries = Vec::new();
+fn parse_subtree<'raw, I>(iter: &mut Peekable<I>, parent_indent: u32) -> CostTree<'raw>
+where
+    I: Iterator<Item = Entry<'raw>>,
+{
+    let mut entries = Vec::new();
 
-        while let Some(next_indent) = self.next_indent() {
-            if next_indent <= parent_indent {
-                break;
-            }
-
-            let entry = self
-                .parse_entry()?
-                .expect("unreachable: pattern match above");
-            let subtree = self.parse_subtree(next_indent)?;
-            entries.push((entry, subtree));
+    while let Some(entry) = iter.peek() {
+        if entry.indent <= parent_indent {
+            break;
         }
 
-        Ok(CostTree { entries })
+        let entry = iter.next().expect("unreachable: pattern match above");
+        let subtree = parse_subtree(iter, entry.indent);
+        entries.push((entry, subtree));
     }
 
-    fn parse_tree(&mut self) -> Result<CostTree, ParserError> {
-        let mut t = self.parse_subtree(0)?;
-        for (entry, _) in t.entries.iter_mut() {
-            entry.opened = true;
-        }
-        Ok(t)
+    CostTree { entries }
+}
+
+fn parse_tree<'raw, I>(iter: &mut Peekable<I>) -> CostTree<'raw>
+where
+    I: Iterator<Item = Entry<'raw>>,
+{
+    let mut t = parse_subtree(iter, 0);
+    for (entry, _) in t.entries.iter_mut() {
+        entry.opened = true;
     }
+    t
 }
 
 #[derive(Debug)]
@@ -880,11 +947,30 @@ enum NewWindow {
     },
 }
 
-struct Window {
+struct Window<'raw> {
     title: String,
-    tree: CostTree,
+    tree: CostTree<'raw>,
     root_id: u32,
     fname: String,
+    raw: Rc<StringStorage<'raw>>,
+}
+
+struct StringStorage<'raw> {
+    data: Pin<Box<str>>,
+    _ty: PhantomData<&'raw ()>,
+}
+
+impl<'raw> StringStorage<'raw> {
+    fn new(data: String) -> Self {
+        Self {
+            data: Box::into_pin(data.into_boxed_str()),
+            _ty: PhantomData,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.data
+    }
 }
 
 fn to_id(id: u32) -> Id {
