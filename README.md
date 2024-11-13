@@ -2,6 +2,8 @@
 
 Graphical viewer for GHC `.prof` files
 
+![demo](./img/demo.png)
+
 ## Usage
 
 ```
@@ -17,7 +19,7 @@ $ imghcprof <input.prof>
 
 ## Features
 
-- Fast. Can parse and display ~230MB `.prof` file in under a second on my laptop
+- Fast. Can parse and display ~230MB `.prof` file in under two seconds on my laptop
 
 ## Installation
 
@@ -27,7 +29,7 @@ Prerequisites:
 - Enabled flakes
 
 ```
-$ nix run github:t4ccer/imghcprof <input.prof>
+$ nix run github:t4ccer/imghcprof [INPUTS...]
 ```
 
 ### With `cargo`

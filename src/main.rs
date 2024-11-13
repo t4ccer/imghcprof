@@ -1,16 +1,13 @@
-#![allow(dead_code)]
-
 use imgui::{
     Id, ProgressBar, SelectableFlags, TableColumnFlags, TableColumnSetup, TableFlags,
     TableSortDirection, TreeNodeFlags,
 };
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     env,
-    ffi::OsStr,
+    ffi::{CString, OsStr},
     fmt::Display,
-    fs::{self, read_dir, File},
+    fs::{read_dir, File},
     io::Read,
     num::{ParseFloatError, ParseIntError},
     path::{Path, PathBuf},
@@ -21,239 +18,355 @@ use std::{
 mod boilerplate_sdl2;
 
 fn main() {
-    macro_rules! err_exit {
-        () => {
-            err_exit!("imghcprof: usage: imghcprof <input.prof>")
-        };
-        ($($arg:tt)*) => {{
-            eprintln!($($arg)*);
-            std::process::exit(1)
-        }};
-    }
+    let mut windows: Vec<(bool, Window)> = Vec::new();
 
+    // There can be duplicate window titles so we add invisible counter
+    let mut next_window_no = 0;
+    let mut init_windows = Vec::new();
     let mut args = env::args().into_iter();
-    let _prog = args.next().unwrap_or_else(|| err_exit!());
-    let input_file = args.next().unwrap_or_else(|| err_exit!());
-    if !args.next().is_none() {
-        err_exit!();
+    let _prog = args.next();
+    for arg in args {
+        if arg == "-h" || arg == "--help" {
+            eprintln!("Usage: imghcprof [FILES...]");
+            std::process::exit(1);
+        }
+
+        let new = NewWindow::Profile {
+            input_file: arg.into(),
+        };
+        init_windows.push(new);
     }
-
-    let mut input = String::new();
-    let mut f = File::open(&input_file).unwrap_or_else(|err| {
-        err_exit!("imghcprof: Could not open input file '{input_file}': {err}")
-    });
-    f.read_to_string(&mut input).unwrap_or_else(|err| {
-        err_exit!("imghcprof: Could not read input file '{input_file}': {err}")
-    });
-
-    // let mut parser = Parser::new(&input).unwrap_or_else(|err| {
-    //     err_exit!("imghcprof: Could not parse input file '{input_file}': {err}")
-    // });
-    // let mut tree = parser.parse_tree().unwrap_or_else(|err| {
-    //     err_exit!("imghcprof: Could not parse input file '{input_file}': {err}")
-    // });
-    // tree.open_interesting();
-
-    let mut first_run = true;
-    let mut windows: Vec<(Option<bool>, Window)> = Vec::new();
-    // windows.push((
-    //     None,
-    //     Window {
-    //         title: "Profile".to_string(),
-    //         tree,
-    //     },
-    // ));
 
     // Windows request new windows via this mutex
     let new_window: Arc<Mutex<Option<NewWindow>>> = Arc::new(Mutex::new(None));
 
-    // There can be duplicate window titles so we add invisible counter
-    let mut next_window_no = 0;
-    let mut file_picker = FilePicker::new(env::current_dir().unwrap_or("/".into()));
-    let mut selecting_file = true;
+    let mut file_picker = FilePicker::new(env::current_dir().unwrap_or("/".into()), |path| {
+        path.file_name()
+            .is_some_and(|f| f.to_str().is_some_and(|s| s.ends_with(".prof")))
+    });
+    let mut selecting_file = false;
 
     boilerplate_sdl2::draw("imghcprof", |ui| {
         // Create main tab with profiler window
-        unsafe {
+        let dockspace = unsafe {
             let dockspace = imgui_sys::igDockSpaceOverViewport(
                 imgui_sys::igGetMainViewport(),
                 imgui_sys::ImGuiDockNodeFlags_PassthruCentralNode as i32,
                 core::ptr::null(),
             );
-            if first_run {
-                first_run = false;
-                imgui_sys::igDockBuilderDockWindow(c"Profile".as_ptr().cast(), dockspace);
-            }
+
             dockspace
         };
 
+        for init_window in init_windows.drain(..) {
+            add_new_window(init_window, &mut windows, &mut next_window_no, dockspace);
+        }
+
         if let Some(_main_menu) = ui.begin_main_menu_bar() {
-            if let Some(_new_menu) = ui.begin_menu("Open") {
-                if ui.menu_item(".perf file") {
-                    selecting_file = true;
-                }
+            if let Some(_new_menu) = ui.begin_menu("New") {
+                selecting_file = true;
             }
         }
 
         if selecting_file {
+            unsafe {
+                imgui_sys::igSetNextWindowSize(
+                    imgui_sys::ImVec2 { x: 300.0, y: 500.0 },
+                    imgui_sys::ImGuiCond_Appearing as i32,
+                );
+                imgui_sys::igSetNextWindowPos(
+                    imgui_sys::ImVec2 { x: 50.0, y: 50.0 },
+                    imgui_sys::ImGuiCond_Appearing as i32,
+                    imgui_sys::ImVec2 { x: 0.0, y: 0.0 },
+                );
+            }
+
             ui.open_popup("Select File");
             if let Some(_t) = ui.begin_modal_popup("Select File") {
                 if let Some(picked) = file_picker.draw(ui) {
-                    dbg!(picked);
+                    if let Some(picked) = picked {
+                        *new_window.lock().unwrap() =
+                            Some(NewWindow::Profile { input_file: picked });
+                    }
+                    file_picker.picked = None;
                     selecting_file = false;
                 }
             }
         }
 
-        ui.show_demo_window(&mut true);
-
-        return;
-
         for (is_opened, window) in &mut windows {
-            let mut w = ui
-                .window(&window.title)
+            ui.window(&window.title)
                 .menu_bar(false)
                 .collapsible(false)
                 .title_bar(true)
-                .resizable(true);
-
-            if let Some(is_opened) = is_opened {
-                w = w.opened(is_opened);
-            }
-
-            w.build(|| {
-                draw_cost_tree(&ui, &mut window.tree, new_window.clone());
-            });
+                .opened(is_opened)
+                .resizable(true)
+                .build(|| {
+                    draw_cost_tree(&ui, &mut window.tree, new_window.clone(), window.root_id);
+                });
         }
 
-        windows.retain(|(is_opened, _)| match is_opened {
-            None => true,
-            Some(true) => true,
-            Some(false) => false,
-        });
+        windows.retain(|(is_opened, _)| *is_opened);
 
         if let Some(new) = new_window.lock().unwrap().take() {
-            match new {
-                NewWindow::IncomingCalls {
-                    module,
-                    source,
-                    name,
-                } => {
-                    let new_tree = CostTree::find(&windows[0].1.tree, &module, &source, &name);
-                    let title = format!("Calls to `{name}`## {next_window_no}");
-                    windows.push((
-                        Some(true),
-                        Window {
-                            title,
-                            tree: new_tree,
-                        },
-                    ));
-                    next_window_no += 1;
-                }
-                NewWindow::Focus { name, cost_center } => {
-                    if let Some(new_tree) = CostTree::focus(&windows[0].1.tree, cost_center) {
-                        let title = format!("Focus on `{name}`## {next_window_no}");
-                        windows.push((
-                            Some(true),
-                            Window {
-                                title,
-                                tree: new_tree,
-                            },
-                        ));
-                        next_window_no += 1;
-                    }
-                }
-            }
+            add_new_window(new, &mut windows, &mut next_window_no, dockspace);
         }
     });
 }
 
-struct FilePicker {
-    picked: Option<PathBuf>,
-    initial_path: PathBuf,
-    show_all: bool,
+fn add_new_window(
+    new: NewWindow,
+    windows: &mut Vec<(bool, Window)>,
+    next_window_no: &mut u32,
+    dockspace: imgui_sys::ImGuiID,
+) {
+    match new {
+        NewWindow::IncomingCalls {
+            module,
+            source,
+            name,
+            root_id,
+        } => {
+            let new_tree =
+                CostTree::find(&windows[root_id as usize].1.tree, &module, &source, &name);
+            let title = format!(
+                "Calls to `{}` (`{}`)## {}",
+                name, windows[root_id as usize].1.fname, next_window_no
+            );
+            let ctitle = CString::new(title.as_bytes()).unwrap();
+            unsafe {
+                imgui_sys::igDockBuilderDockWindow(ctitle.as_ptr().cast(), dockspace);
+            }
+            windows.push((
+                true,
+                Window {
+                    title,
+                    tree: new_tree,
+                    root_id,
+                    fname: windows[root_id as usize].1.fname.clone(),
+                },
+            ));
+            *next_window_no += 1;
+        }
+        NewWindow::Focus {
+            name,
+            cost_center,
+            root_id,
+        } => {
+            if let Some(new_tree) = CostTree::focus(&windows[root_id as usize].1.tree, cost_center)
+            {
+                let title = format!(
+                    "Focus on `{}` (`{}`)## {}",
+                    name, windows[root_id as usize].1.fname, next_window_no
+                );
+                let ctitle = CString::new(title.as_bytes()).unwrap();
+                unsafe {
+                    imgui_sys::igDockBuilderDockWindow(ctitle.as_ptr().cast(), dockspace);
+                }
+                windows.push((
+                    true,
+                    Window {
+                        title,
+                        tree: new_tree,
+                        root_id,
+                        fname: windows[root_id as usize].1.fname.clone(),
+                    },
+                ));
+                *next_window_no += 1;
+            }
+        }
+        NewWindow::Profile { input_file } => {
+            let mk_tree = || -> Option<CostTree> {
+                let mut input = String::new();
+                let mut f = File::open(&input_file)
+                    .map_err(|err| {
+                        eprintln!("imghcprof: Could not open input file '{input_file:?}': {err}");
+                        ()
+                    })
+                    .ok()?;
+                f.read_to_string(&mut input)
+                    .map_err(|err| {
+                        eprintln!("imghcprof: Could not read input file '{input_file:?}': {err}");
+                        ()
+                    })
+                    .ok()?;
+
+                let mut parser = Parser::new(&input)
+                    .map_err(|err| {
+                        eprintln!("imghcprof: Could not parse input file '{input_file:?}': {err}");
+                        ()
+                    })
+                    .ok()?;
+                let mut tree = parser
+                    .parse_tree()
+                    .map_err(|err| {
+                        eprintln!("imghcprof: Could not parse input file '{input_file:?}': {err}");
+                        ()
+                    })
+                    .ok()?;
+                tree.open_interesting();
+                Some(tree)
+            };
+
+            if let Some(tree) = mk_tree() {
+                let fname = input_file
+                    .file_name()
+                    .unwrap_or(OsStr::new("?"))
+                    .to_str()
+                    .unwrap_or("?");
+
+                let title = format!("Profile `{fname}`## {next_window_no}");
+                let ctitle = CString::new(title.as_bytes()).unwrap();
+                unsafe {
+                    imgui_sys::igDockBuilderDockWindow(ctitle.as_ptr().cast(), dockspace);
+                }
+                windows.push((
+                    true,
+                    Window {
+                        title,
+                        tree,
+                        root_id: *next_window_no,
+                        fname: fname.to_owned(),
+                    },
+                ));
+                *next_window_no += 1;
+            }
+        }
+    }
 }
 
-impl FilePicker {
-    fn new(initial_path: PathBuf) -> Self {
+struct FilePicker<F> {
+    picked: Option<PathBuf>,
+    current_dir: PathBuf,
+    show_all: bool,
+    filter: F,
+}
+
+impl<F> FilePicker<F>
+where
+    F: Fn(&Path) -> bool,
+{
+    fn new(initial_path: PathBuf, filter: F) -> Self {
         Self {
             picked: None,
-            initial_path,
+            current_dir: initial_path,
             show_all: false,
+            filter,
         }
     }
 
-    fn draw(&mut self, ui: &imgui::Ui) -> Option<PathBuf> {
+    fn draw(&mut self, ui: &imgui::Ui) -> Option<Option<PathBuf>> {
+        // TODO: Cache fs results to not spam the kernel/allocator too mutch
+        // but this is rarely on screen so it's fine for now
+
+        let mut ancestors = self.current_dir.ancestors().into_iter();
+        let _ = ancestors.next();
+        let up = ancestors.next();
+
+        if ui.button("Up") {
+            if let Some(d) = up {
+                self.current_dir = d.to_owned();
+                self.picked = None;
+                return None;
+            }
+        }
+
+        ui.same_line();
         let mut selected = false;
-        ui.disabled(self.picked.is_none(), || selected = ui.button("Select"));
+        ui.disabled(self.picked.is_none(), || selected = ui.button("Open"));
         ui.same_line();
         ui.checkbox("Show all", &mut self.show_all);
+        ui.same_line();
+        if ui.button("Cancel") {
+            return Some(None);
+        }
 
-        let mut ancestors = self
-            .initial_path
-            .ancestors()
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        ancestors.reverse();
-        draw_top_directory(ui, ancestors.as_slice(), &mut self.picked);
-        selected.then_some(self.picked.clone()?)
-    }
-}
-
-fn draw_top_directory(ui: &imgui::Ui, paths: &[PathBuf], picked: &mut Option<PathBuf>) {
-    if paths.len() == 0 {
-        // unreachable?
-        return;
-    } else if paths.len() == 1 {
-        draw_directory(ui, &paths[0], picked);
-    } else {
-        if let Some(_t) = ui
-            .tree_node_config(
-                paths[0]
+        macro_rules! get_name {
+            ($f:expr) => {
+                $f.path()
                     .file_name()
-                    .unwrap_or(OsStr::new("/"))
+                    .unwrap_or(OsStr::new(""))
                     .to_str()
-                    .unwrap_or("???"),
-            )
-            .opened(true, imgui::Condition::Appearing)
+                    .unwrap_or("<?>")
+            };
+        }
+
+        if let Some(_t) = ui
+            .tree_node_config(self.current_dir.as_path().to_str().unwrap_or("???"))
+            .open_on_arrow(false)
+            .open_on_double_click(false)
+            .opened(true, imgui::Condition::Always)
             .push()
         {
-            draw_top_directory(ui, &paths[1..], picked);
-        }
-    }
-}
-
-fn draw_directory(ui: &imgui::Ui, d: &PathBuf, picked: &mut Option<PathBuf>) {
-    // TODO: PERF! Cache results, etc. don't syscall and alloc on every frame
-    // but this is open rarely and for rather short so not a priority
-
-    for f in read_dir(&d).unwrap() {
-        let f = f.unwrap();
-
-        if f.file_type().unwrap().is_dir() {
-            if let Some(_t) = ui.tree_node(f.path().file_name().unwrap().to_str().unwrap_or("<?>"))
-            {
-                draw_directory(ui, &f.path(), picked);
+            if ui.is_item_clicked() {
+                if let Some(d) = up {
+                    self.current_dir = d.to_owned();
+                    self.picked = None;
+                }
             }
-        } else {
-            let selected = picked.as_ref().is_some_and(|picked| picked == &f.path());
 
-            if let Some(_t) = ui
-                .tree_node_config(f.path().file_name().unwrap().to_str().unwrap_or("<?>"))
-                .bullet(true)
-                .leaf(true)
-                .selected(selected)
-                .push()
-            {
-                if ui.is_item_clicked() {
-                    *picked = Some(f.path().clone());
+            let Ok(dir_iter) = read_dir(&self.current_dir) else {
+                return selected.then_some(self.picked.clone());
+            };
+            let Ok(mut dir_entries) = dir_iter.collect::<Result<Vec<_>, _>>() else {
+                return selected.then_some(self.picked.clone());
+            };
+
+            dir_entries.sort_by(|f1, f2| get_name!(f1).cmp(get_name!(f2)));
+
+            for f in dir_entries {
+                if f.file_type().unwrap().is_dir() {
+                    if let Some(_t) = ui
+                        .tree_node_config(get_name!(f))
+                        .open_on_arrow(false)
+                        .open_on_double_click(false)
+                        .opened(false, imgui::Condition::Always)
+                        .push()
+                    {
+                        self.current_dir = f.path();
+                        self.picked = None;
+                    }
+                } else {
+                    if !(self.filter)(&f.path()) && !self.show_all {
+                        continue;
+                    }
+
+                    let selected = self
+                        .picked
+                        .as_ref()
+                        .is_some_and(|picked| picked == &f.path());
+
+                    if let Some(_t) = ui
+                        .tree_node_config(
+                            f.path()
+                                .file_name()
+                                .unwrap_or(OsStr::new(""))
+                                .to_str()
+                                .unwrap_or("<?>"),
+                        )
+                        .bullet(true)
+                        .leaf(true)
+                        .selected(selected)
+                        .push()
+                    {
+                        if ui.is_item_clicked() {
+                            self.picked = Some(f.path().clone());
+                        }
+                    }
                 }
             }
         }
+
+        selected.then_some(self.picked.clone())
     }
 }
 
-fn draw_cost_tree(ui: &imgui::Ui, tree: &mut CostTree, new_window: Arc<Mutex<Option<NewWindow>>>) {
+fn draw_cost_tree(
+    ui: &imgui::Ui,
+    tree: &mut CostTree,
+    new_window: Arc<Mutex<Option<NewWindow>>>,
+    root_id: u32,
+) {
     macro_rules! column {
         ($str:expr, $size:expr) => {
             column!($str, $size, TableColumnFlags::empty())
@@ -335,7 +448,7 @@ fn draw_cost_tree(ui: &imgui::Ui, tree: &mut CostTree, new_window: Arc<Mutex<Opt
             });
         }
 
-        draw_cost_subtree(&ui, tree, new_window);
+        draw_cost_subtree(&ui, tree, new_window, root_id);
     }
 }
 
@@ -343,6 +456,7 @@ fn draw_cost_subtree(
     ui: &imgui::Ui,
     tree: &mut CostTree,
     new_window: Arc<Mutex<Option<NewWindow>>>,
+    root_id: u32,
 ) {
     for (entry, children) in tree.entries.iter_mut() {
         ui.table_next_row();
@@ -387,6 +501,7 @@ fn draw_cost_subtree(
                     module: entry.module.to_string(),
                     name: entry.name.to_string(),
                     source: entry.source.to_string(),
+                    root_id,
                 });
                 ui.close_current_popup();
             }
@@ -394,6 +509,7 @@ fn draw_cost_subtree(
                 *new_window.lock().unwrap() = Some(NewWindow::Focus {
                     name: entry.name.to_string(),
                     cost_center: entry.cost_center.value,
+                    root_id,
                 });
                 ui.close_current_popup();
             }
@@ -446,62 +562,55 @@ fn draw_cost_subtree(
         ui.text(&entry.source);
 
         if let Some(_open) = open {
-            draw_cost_subtree(ui, children, new_window.clone());
+            draw_cost_subtree(ui, children, new_window.clone(), root_id);
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Displayed<'src, T> {
+struct Displayed<T> {
     value: T,
-    string: Cow<'src, str>,
+    string: String,
 }
 
-impl<'src, T> Displayed<'src, T>
+impl<T> Displayed<T>
 where
     T: Display,
 {
-    pub fn borrowed(value: T, string: &'src str) -> Displayed<T> {
+    pub fn new(value: T) -> Displayed<T> {
         Displayed {
-            value,
-            string: Cow::Borrowed(string),
-        }
-    }
-
-    pub fn owned(value: T) -> Displayed<'static, T> {
-        Displayed {
-            string: Cow::Owned(value.to_string()),
+            string: value.to_string(),
             value,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
-struct Entry<'src> {
-    cost_center: Displayed<'src, u64>,
-    name: Cow<'src, str>,
-    entries: Displayed<'src, u64>,
-    individual_time: Displayed<'src, f32>,
-    individual_alloc: Displayed<'src, f32>,
-    inherited_time: Displayed<'src, f32>,
-    inherited_alloc: Displayed<'src, f32>,
-    module: Cow<'src, str>,
-    source: Cow<'src, str>,
+struct Entry {
+    cost_center: Displayed<u64>,
+    name: String,
+    entries: Displayed<u64>,
+    individual_time: Displayed<f32>,
+    individual_alloc: Displayed<f32>,
+    inherited_time: Displayed<f32>,
+    inherited_alloc: Displayed<f32>,
+    module: String,
+    source: String,
     opened: bool,
 }
 
-impl<'src> Entry<'src> {
+impl Entry {
     fn is_interesting(&self) -> bool {
-        self.inherited_time.value >= 95.0
+        self.inherited_time.value >= 15.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
-struct CostTree<'src> {
-    entries: Vec<(Entry<'src>, CostTree<'src>)>,
+struct CostTree {
+    entries: Vec<(Entry, CostTree)>,
 }
 
-impl<'src> CostTree<'src> {
+impl CostTree {
     fn sort_by_f32(&mut self, dir: TableSortDirection, f: impl Copy + Fn(&Entry) -> f32) {
         match dir {
             TableSortDirection::Ascending => {
@@ -560,12 +669,7 @@ impl<'src> CostTree<'src> {
         }
     }
 
-    fn find<'a>(
-        &'a self,
-        target_module: &str,
-        target_source: &str,
-        target_name: &str,
-    ) -> CostTree<'src> {
+    fn find<'a>(&'a self, target_module: &str, target_source: &str, target_name: &str) -> CostTree {
         let mut entries = Vec::new();
 
         for (entry, child_tree) in &self.entries {
@@ -594,13 +698,13 @@ impl<'src> CostTree<'src> {
                 inherited_time += child.inherited_time.value;
                 inherited_alloc += child.inherited_alloc.value;
             }
-            entry.inherited_time = Displayed::owned(inherited_time);
-            entry.inherited_alloc = Displayed::owned(inherited_alloc);
+            entry.inherited_time = Displayed::new(inherited_time);
+            entry.inherited_alloc = Displayed::new(inherited_alloc);
         });
         CostTree { entries }
     }
 
-    fn focus(&self, cost_center: u64) -> Option<CostTree<'src>> {
+    fn focus(&self, cost_center: u64) -> Option<CostTree> {
         for (entry, children) in &self.entries {
             if entry.cost_center.value == cost_center {
                 return Some(CostTree {
@@ -676,7 +780,7 @@ impl<'src> Parser<'src> {
             .map(|line| line.chars().take_while(|&c| c == ' ').count() as u32 + 1)
     }
 
-    pub fn parse_entry(&mut self) -> Result<Option<Entry<'src>>, ParserError> {
+    pub fn parse_entry(&mut self) -> Result<Option<Entry>, ParserError> {
         let Some(line) = self.line else {
             return Ok(None);
         };
@@ -692,9 +796,9 @@ impl<'src> Parser<'src> {
                     // We assume that this is the only case and hard code it here
                     values.next().ok_or_else(|| ParserError::EndOfInput)?;
                     values.next().ok_or_else(|| ParserError::EndOfInput)?;
-                    Cow::Borrowed(NO_LOCATION_INFO)
+                    NO_LOCATION_INFO.to_owned()
                 } else {
-                    Cow::Borrowed(start)
+                    start.to_owned()
                 }
             }};
             (u64) => {{
@@ -702,14 +806,14 @@ impl<'src> Parser<'src> {
                 let parsed = string
                     .parse::<u64>()
                     .map_err(|err| ParserError::ParseIntError(err, line.to_string()))?;
-                Displayed::borrowed(parsed, string)
+                Displayed::new(parsed)
             }};
             (f32) => {{
                 let string = values.next().ok_or_else(|| ParserError::EndOfInput)?;
                 let parsed = string
                     .parse::<f32>()
                     .map_err(|err| ParserError::ParseFloatError(err, line.to_string()))?;
-                Displayed::borrowed(parsed, string)
+                Displayed::new(parsed)
             }};
         }
 
@@ -731,7 +835,7 @@ impl<'src> Parser<'src> {
         Ok(Some(entry))
     }
 
-    fn parse_subtree(&mut self, parent_indent: u32) -> Result<CostTree<'src>, ParserError> {
+    fn parse_subtree(&mut self, parent_indent: u32) -> Result<CostTree, ParserError> {
         let mut entries = Vec::new();
 
         while let Some(next_indent) = self.next_indent() {
@@ -749,7 +853,7 @@ impl<'src> Parser<'src> {
         Ok(CostTree { entries })
     }
 
-    fn parse_tree(&mut self) -> Result<CostTree<'src>, ParserError> {
+    fn parse_tree(&mut self) -> Result<CostTree, ParserError> {
         let mut t = self.parse_subtree(0)?;
         for (entry, _) in t.entries.iter_mut() {
             entry.opened = true;
@@ -764,16 +868,23 @@ enum NewWindow {
         module: String,
         source: String,
         name: String,
+        root_id: u32,
     },
     Focus {
         name: String,
         cost_center: u64,
+        root_id: u32,
+    },
+    Profile {
+        input_file: PathBuf,
     },
 }
 
-struct Window<'src> {
+struct Window {
     title: String,
-    tree: CostTree<'src>,
+    tree: CostTree,
+    root_id: u32,
+    fname: String,
 }
 
 fn to_id(id: u32) -> Id {
