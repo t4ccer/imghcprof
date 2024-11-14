@@ -503,6 +503,7 @@ fn draw_cost_subtree(
         if ui
             .selectable_config("##nolabel")
             .flags(SelectableFlags::SPAN_ALL_COLUMNS)
+            .size([0.0, 16.0])
             .build()
         {
             entry.opened = !entry.opened;
@@ -564,7 +565,7 @@ fn draw_cost_subtree(
         ui.table_next_column();
         ui.text(&entry.entries.string);
 
-        let pg_height = 13.0;
+        let pg_height = 16.0;
 
         ui.table_next_column();
         ProgressBar::new(entry.inherited_time.value / 100.0)
