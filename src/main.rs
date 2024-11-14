@@ -830,17 +830,13 @@ impl<'raw> Parser<'raw> {
             for i in 0..no_threads {
                 let lines = self.lines.clone();
                 let t = scope.spawn(move || {
-                    let mut result = Vec::with_capacity(lines_per_thread);
-                    for line in
-                        lines
-                            .clone()
-                            .skip(lines_per_thread * i)
-                            .take(if i + 1 == no_threads {
-                                usize::MAX
-                            } else {
-                                lines_per_thread
-                            })
-                    {
+                    let capacity = if i + 1 == no_threads {
+                        no_lines - lines_per_thread * (no_threads - 1)
+                    } else {
+                        lines_per_thread
+                    };
+                    let mut result = Vec::with_capacity(capacity);
+                    for line in lines.clone().skip(lines_per_thread * i).take(capacity) {
                         result.push(Self::parse_line(line)?);
                     }
                     Ok::<_, ParserError>(result)
