@@ -231,7 +231,7 @@ fn add_new_window(
                     })
                     .ok()?;
 
-                let mut tree = parse_tree(&mut flat.into_iter().peekable());
+                let mut tree = parse_tree(&mut flat.into_iter().flatten().peekable());
                 tree.open_interesting();
                 Some((input, tree))
             };
@@ -816,7 +816,7 @@ impl<'raw> Parser<'raw> {
         Ok(())
     }
 
-    fn parse_entries(&self) -> Result<Vec<Entry<'raw>>, ParserError> {
+    fn parse_entries(&self) -> Result<Vec<Vec<Entry<'raw>>>, ParserError> {
         let no_lines = self.lines.clone().count();
         let no_threads = std::thread::available_parallelism()
             .map(NonZero::get)
@@ -825,7 +825,7 @@ impl<'raw> Parser<'raw> {
 
         std::thread::scope(|scope| {
             let mut threads = Vec::with_capacity(no_threads);
-            let mut combined = Vec::with_capacity(no_lines);
+            let mut combined = Vec::with_capacity(no_threads);
 
             for i in 0..no_threads {
                 let lines = self.lines.clone();
@@ -850,7 +850,7 @@ impl<'raw> Parser<'raw> {
 
             for t in threads {
                 let r = t.join().unwrap()?;
-                combined.extend(r);
+                combined.push(r);
             }
 
             Ok(combined)

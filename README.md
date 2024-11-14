@@ -27,7 +27,7 @@ Startup time, lower is better.
 
 | Tool                                                     | Time     |
 |----------------------------------------------------------|----------|
-| [imghcprof](https://github.com/t4ccer/imghcprof)         |   920 ms |
+| [imghcprof](https://github.com/t4ccer/imghcprof)         |   831 ms |
 | [profiterole](https://github.com/ndmitchell/profiterole) |  7566 ms |
 | [profiteur](http://github.com/jaspervdj/profiteur)       |  7352 ms |
 | [ghcprofview](https://github.com/portnov/ghcprofview-hs) | 31000 ms |
