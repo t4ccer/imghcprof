@@ -510,6 +510,11 @@ fn draw_cost_subtree(
         }
 
         if let Some(_t) = ui.begin_popup_context_item() {
+            ui.text("Name:");
+            ui.same_line();
+            ui.text(&entry.name);
+            ui.separator();
+
             if ui.menu_item("Collapse all") {
                 entry.opened = false;
                 children.collapse_all();
